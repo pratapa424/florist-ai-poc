@@ -12,8 +12,16 @@ const wss = new WebSocketServer({ server });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// ---- POC in-memory transcript store (resets on redeploy) ----
+// In production this is your real database / florist API.
+const transcripts = {};
+
+function saveTranscript(id, record) {
+  transcripts[id] = record;
+  console.log('Saved transcript for', id, '-> fetch at /get-transcript?id=' + id);
+}
+
 // ---- Simulated florists (keypad digit -> florist) ----
-// Stands in for "which florist phone forwarded the call"
 const FLORISTS = {
   '1': { name: 'Flowers by Jane', phone: '+15551110001', tfid: '00006655' },
   '2': { name: 'City Florist',    phone: '+15551110002', tfid: '11223360' }
@@ -21,7 +29,24 @@ const FLORISTS = {
 
 app.get('/', (req, res) => res.send('Florist AI POC running'));
 
-// Step 1 - ask which florist (simulates the florist-phone lookup)
+// Your app calls this to load the full transcript by ID
+app.get('/get-transcript', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*'); // POC only - lock down in prod
+  const id = req.query.id;
+  const record = transcripts[id];
+  if (!record) return res.status(404).json({ error: 'not found', id: id });
+  res.json(record);
+});
+
+// Optional: POST a transcript from an external service
+app.post('/save-transcript', (req, res) => {
+  const id = req.body.id;
+  if (!id) return res.status(400).json({ error: 'id required' });
+  saveTranscript(id, req.body.record || {});
+  res.json({ ok: true, id: id });
+});
+
+// Step 1 - ask which florist (simulates florist-phone lookup)
 app.post('/incoming-call', (req, res) => {
   const host = req.headers.host;
   res.set('Content-Type', 'text/xml');
@@ -41,7 +66,6 @@ app.post('/start-ai', (req, res) => {
   const host = req.headers.host;
   const digit = req.body.Digits || req.query.Digits || '1';
   const florist = FLORISTS[digit] || FLORISTS['1'];
-
   console.log('Digit:', digit, '-> florist:', florist.name, 'tfid:', florist.tfid);
 
   res.set('Content-Type', 'text/xml');
@@ -69,9 +93,9 @@ app.post('/enqueue-to-flex', (req, res) => {
     sentiment: handoffData.sentiment || 'neutral',
     escalationReason: handoffData.reason || 'Customer requested agent',
     orderDetails: handoffData.orderDetails || {},
-    floristId: handoffData.tfid || '',          // <-- dynamic tfid
+    floristId: handoffData.tfid || '',
     floristName: handoffData.floristName || '',
-    floristPhone: handoffData.floristPhone || '',
+    conversationId: handoffData.conversationId || '',  // <-- reference to full transcript
     taskChannel: 'voice'
   };
 
@@ -94,6 +118,8 @@ wss.on('connection', function(ws) {
   var sessionTfid = '';
   var sessionFloristName = '';
   var sessionFloristPhone = '';
+  var sessionCustomerPhone = '';
+  var conversationId = '';
 
   var messages = [
     {
@@ -132,7 +158,9 @@ wss.on('connection', function(ws) {
         sessionTfid = params.tfid || '';
         sessionFloristName = params.floristName || '';
         sessionFloristPhone = params.floristPhone || '';
-        console.log('Session tfid:', sessionTfid, 'florist:', sessionFloristName);
+        sessionCustomerPhone = msg.from || '';
+        conversationId = msg.callSid || ('conv-' + Date.now());
+        console.log('Session started. conversationId:', conversationId, 'tfid:', sessionTfid);
         return;
       }
 
@@ -150,6 +178,28 @@ wss.on('connection', function(ws) {
 
         if (choice.finish_reason === 'tool_calls') {
           var args = JSON.parse(choice.message.tool_calls[0].function.arguments);
+
+          // Build the full transcript from the conversation so far
+          var transcript = messages
+            .filter(function(m) { return m.role === 'user' || m.role === 'assistant'; })
+            .map(function(m) { return { role: m.role, text: m.content }; });
+
+          // Save full payload server-side (Pattern B)
+          saveTranscript(conversationId, {
+            conversationId: conversationId,
+            tfid: sessionTfid,
+            floristName: sessionFloristName,
+            floristPhone: sessionFloristPhone,
+            customerPhone: sessionCustomerPhone,
+            sentiment: args.sentiment,
+            escalationReason: args.reason,
+            callSummary: args.callSummary,
+            orderDetails: args.orderDetails || {},
+            transcript: transcript,
+            savedAt: new Date().toISOString()
+          });
+
+          // Only the reference + small fields travel with the task
           ws.send(JSON.stringify({
             type: 'end',
             handoffData: JSON.stringify({
@@ -159,7 +209,7 @@ wss.on('connection', function(ws) {
               orderDetails: args.orderDetails || {},
               tfid: sessionTfid,
               floristName: sessionFloristName,
-              floristPhone: sessionFloristPhone
+              conversationId: conversationId
             })
           }));
         } else {
